@@ -1,4 +1,5 @@
 // sfl-signals
+// 0.1.0
 //
 // dependency-free signals implementation that uses weakref for handling garbage
 // collected referenced. all operations are internally batched to prevent cascading
