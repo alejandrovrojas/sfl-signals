@@ -37,13 +37,13 @@ interface ReadonlySignal<T> {
 }
 
 const processing = {
-	signals:        new Set<Signal<unknown>>(),       // signals accessed during current batch
-	computed:       null as Computed<unknown> | null, // currently executing computed
-	batch_effects:  null as Set<() => void> | null,   // effects to run after batch
+	signals:       new Set<Signal<unknown>>(),       // signals accessed during current batch
+	computed:      null as Computed<unknown> | null, // currently executing computed
+	batch_effects: null as Set<() => void> | null,   // effects to run after batch
 }
 
 export class Signal<T> {
-	protected _value: T;
+	protected _value:      T;
 	protected _dependents: Set<WeakRef<Signal<unknown>>> = new Set();
 
 	constructor(value: T) {
@@ -57,7 +57,6 @@ export class Signal<T> {
 			if (dependent) {
 				dependent._mark_for_update();
 			} else {
-				// delete garbage collected references
 				this._dependents.delete(dependent_ref);
 			}
 		});
@@ -70,7 +69,6 @@ export class Signal<T> {
 	public get value(): T {
 		const value = this._value;
 
-		// inside a computed
 		if (processing.computed !== null) {
 			if (processing.batch_effects !== null) {
 				processing.signals.add(this);
@@ -91,9 +89,12 @@ export class Signal<T> {
 			throw new Error('Cycle detected');
 		}
 
+		if (value === this._value) {
+			return;
+		}
+
 		this._value = value;
 
-		// prevents cascading effects
 		batch(() => {
 			this._mark_for_update();
 		});
@@ -101,11 +102,13 @@ export class Signal<T> {
 }
 
 export class Computed<T> extends Signal<T> implements ReadonlySignal<T> {
-	protected _ref:          WeakRef<this>                  = new WeakRef(this); // reused weakref for consistent identity
-	protected _first:        boolean                        = true;              // first execution flag
-	protected _must_update:  boolean                        = true;              // dirty flag from dependencies
-	protected _dependencies: Map<Signal<unknown>, unknown>  = new Map();         // tracked dependencies and their last values
-	protected _callback:     ()                             => T;
+	protected _ref:          WeakRef<this>                 = new WeakRef(this);
+	protected _first:        boolean                       = true;
+	protected _must_update:  boolean                       = true;
+	protected _error:        unknown                       = undefined; // cached thrown value
+	protected _has_error:    boolean                       = false;     // whether _error is valid
+	protected _dependencies: Map<Signal<unknown>, unknown> = new Map();
+	protected _callback:     () => T;
 
 	constructor(callback: () => T) {
 		super(undefined as unknown as T);
@@ -134,37 +137,45 @@ export class Computed<T> extends Signal<T> implements ReadonlySignal<T> {
 		if (this._must_update) {
 			this._must_update = false;
 
-			try {
-				let changed = false;
+			let changed = false;
 
-				if (this._first) {
-					this._first = false;
-					changed = true;
-				} else {
-					this._dependencies.forEach((oldValue, parent) => {
-						const newValue = parent.peek();
-
-						if (oldValue !== newValue) {
-							changed = true;
-						}
-					});
-				}
-
-				if (changed) {
-					this._remove_dependencies();
-
-					const old = processing.computed;
-					processing.computed = this;
-
+			if (this._first) {
+				this._first = false;
+				changed     = true;
+			} else {
+				for (const [parent, oldValue] of this._dependencies) {
 					try {
-						this._value = this._callback();
-					} finally {
-						processing.computed = old;
+						if (parent.peek() !== oldValue) {
+							changed = true;
+							break;
+						}
+					} catch {
+						changed = true;
+						break;
 					}
 				}
-			} catch (e) {
-				throw e;
 			}
+
+			if (changed) {
+				this._remove_dependencies();
+
+				const old          = processing.computed;
+				processing.computed = this;
+
+				try {
+					this._value     = this._callback();
+					this._has_error = false;
+				} catch (e) {
+					this._error     = e;
+					this._has_error = true;
+				} finally {
+					processing.computed = old;
+				}
+			}
+		}
+
+		if (this._has_error) {
+			throw this._error;
 		}
 
 		return this._value;
@@ -173,7 +184,6 @@ export class Computed<T> extends Signal<T> implements ReadonlySignal<T> {
 	public get value(): T {
 		const value = this.peek();
 
-		// inside another computed
 		if (processing.computed !== null) {
 			processing.computed._add_dependency(this, value);
 		}
@@ -186,45 +196,86 @@ export class Computed<T> extends Signal<T> implements ReadonlySignal<T> {
 	}
 }
 
-export class Effect<T> extends Computed<T> implements ReadonlySignal<T> {
-	protected _listener: (() => void) | null = null;
+class Effect {
+	private _ref:          WeakRef<Effect>               = new WeakRef(this);
+	private _callback:     () => void;
+	private _dependencies: Map<Signal<unknown>, unknown> = new Map();
+	private _disposed:     boolean                       = false;
+	private _scheduled:    boolean                       = false;
 
-	constructor(callback: () => T) {
-		super(callback);
+	constructor(callback: () => void) {
+		this._callback = callback;
 	}
 
-	protected _mark_for_update() {
+	_mark_for_update() {
+		if (this._disposed || this._scheduled) {
+			return;
+		}
+
 		if (processing.batch_effects === null) {
 			throw new Error('Invalid batch pending state');
 		}
 
-		if (this._listener !== null) {
-			processing.batch_effects!.add(this._listener);
-		}
+		this._scheduled = true;
 
-		super._mark_for_update();
+		processing.batch_effects.add(() => this._run());
 	}
 
-	public _listen(callback: (value: T) => void): () => void {
-		let old_value = this.value;
+	_add_dependency(signal: Signal<unknown>, value: unknown) {
+		this._dependencies.set(signal, value);
+		(signal as any)._dependents.add(this._ref);
+	}
 
-		const listener = () => {
-			const new_value = this.value;
+	private _remove_dependencies() {
+		this._dependencies.forEach((_v, parent) => {
+			(parent as any)._dependents.delete(this._ref);
+		});
 
-			if (old_value !== new_value) {
-				old_value = new_value;
-				callback(old_value);
+		this._dependencies.clear();
+	}
+
+	_run() {
+		if (this._disposed) {
+			return;
+		}
+
+		this._scheduled = false;
+
+		if (this._dependencies.size > 0) {
+			let changed = false;
+
+			for (const [dep, oldValue] of this._dependencies) {
+				try {
+					if (dep.peek() !== oldValue) {
+						changed = true;
+						break;
+					}
+				} catch {
+					changed = true;
+					break;
+				}
 			}
-		};
 
-		this._listener = listener;
+			if (!changed) {
+				return;
+			}
+		}
 
-		callback(old_value);
+		this._remove_dependencies();
 
-		return () => {
-			this._listener = null;
-			this._remove_dependencies();
-		};
+		const old           = processing.computed;
+		processing.computed = this as any;
+
+		try {
+			this._callback();
+		} finally {
+			processing.computed = old;
+		}
+	}
+
+	dispose() {
+		this._disposed = true;
+		this._remove_dependencies();
 	}
 }
 
@@ -237,7 +288,13 @@ export function computed<T>(f: () => T): ReadonlySignal<T> {
 }
 
 export function effect(callback: () => void): () => void {
-	return new Effect(() => batch(callback))._listen(() => {});
+	const e = new Effect(callback);
+
+	batch(() => {
+		e._run();
+	});
+
+	return () => e.dispose();
 }
 
 export function batch<T>(callback: () => T): T {
@@ -250,6 +307,7 @@ export function batch<T>(callback: () => T): T {
 			return callback();
 		} finally {
 			processing.batch_effects = null;
+
 			processing.signals.clear();
 
 			effects.forEach(effect => {
@@ -257,7 +315,6 @@ export function batch<T>(callback: () => T): T {
 			});
 		}
 	} else {
-		// nested batch - just execute inline
 		return callback();
 	}
 }
