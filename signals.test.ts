@@ -653,4 +653,393 @@ tests.run('performance: computed memoization', () => {
 	tests.assert_equal(expensive_call_count, 2);
 });
 
+tests.run('effect: notify remaining listeners after one is disposed', () => {
+	const s = signal(0);
+	let count1 = 0;
+	let count2 = 0;
+	let count3 = 0;
+
+	const dispose1 = effect(() => { s.value; count1++; });
+	const dispose2 = effect(() => { s.value; count2++; });
+	const dispose3 = effect(() => { s.value; count3++; });
+
+	tests.assert_equal(count1, 1);
+	tests.assert_equal(count2, 1);
+	tests.assert_equal(count3, 1);
+
+	dispose2();
+
+	s.value = 1;
+	tests.assert_equal(count1, 2);
+	tests.assert_equal(count2, 1); // disposed, must not run
+	tests.assert_equal(count3, 2);
+
+	dispose1();
+	dispose3();
+});
+
+tests.run('effect: does not re-run when computed dep value unchanged', () => {
+	const s = signal(0);
+	const c = computed(() => { s.value; return 0; }); // always returns 0
+	let effect_count = 0;
+
+	effect(() => { c.value; effect_count++; });
+	tests.assert_equal(effect_count, 1);
+
+	s.value = 1;
+	tests.assert_equal(effect_count, 1); // c still returns 0, effect must not re-run
+});
+
+tests.run('effect: does not run if triggered then disposed in a batch', () => {
+	const a = signal(0);
+	let call_count = 0;
+
+	const dispose = effect(() => { a.value; call_count++; });
+	tests.assert_equal(call_count, 1);
+
+	batch(() => {
+		a.value = 1;
+		dispose();
+	});
+
+	tests.assert_equal(call_count, 1);
+});
+
+tests.run('effect: does not run if triggered, disposed, re-triggered in a batch', () => {
+	const a = signal(0);
+	let call_count = 0;
+
+	const dispose = effect(() => { a.value; call_count++; });
+	tests.assert_equal(call_count, 1);
+
+	batch(() => {
+		a.value = 1;
+		dispose();
+		a.value = 2;
+	});
+
+	tests.assert_equal(call_count, 1);
+});
+
+tests.run('computed: stores thrown errors, recomputes only after dep changes', () => {
+	const a = signal(0);
+	let call_count = 0;
+
+	const c = computed(() => {
+		call_count++;
+		a.value;
+		throw new Error('fail');
+	});
+
+	let caught = 0;
+
+	try { c.value; } catch { caught++; }
+	try { c.value; } catch { caught++; }
+
+	tests.assert_equal(caught, 2);
+	tests.assert_equal(call_count, 1); // second access must use cached throw
+
+	a.value = 1;
+
+	try { c.value; } catch { caught++; }
+
+	tests.assert_equal(call_count, 2); // recomputes after dep change
+});
+
+tests.run('computed: does not leak errors from dependencies', () => {
+	const a = signal(0);
+	const b = computed(() => { a.value; throw new Error('error'); });
+	const c = computed(() => {
+		try { return b.value; } catch { return 'ok'; }
+	});
+
+	tests.assert_equal(c.value, 'ok');
+
+	a.value = 1;
+
+	tests.assert_equal(c.value, 'ok');
+});
+
+tests.run('computed: keeps graph consistent on errors during activation', () => {
+	const a = signal(0);
+	const b = computed(() => { throw new Error('fail'); });
+	const c = computed(() => a.value);
+
+	let threw = false;
+
+	try { b.value; } catch { threw = true; }
+
+	tests.assert(threw);
+
+	a.value = 1;
+
+	tests.assert_equal(c.value, 1);
+});
+
+tests.run('computed: keeps graph consistent on errors mid-graph', () => {
+	const a = signal(0);
+	const b = computed(() => {
+		if (a.value === 1) throw new Error('fail');
+		return a.value;
+	});
+	const c = computed(() => b.value);
+
+	tests.assert_equal(c.value, 0);
+
+	a.value = 1;
+	let threw = false;
+	try { b.value; } catch { threw = true; }
+	tests.assert(threw);
+
+	a.value = 2;
+	tests.assert_equal(c.value, 2);
+});
+
+tests.run('computed: ensures sub updates even if one dep unmarks it', () => {
+	// A -> B and A -> C (always "c") -> D; D must still update via B
+	const a = signal('a');
+	const b = computed(() => a.value);
+	const c = computed(() => { a.value; return 'c'; });
+	let call_count = 0;
+	const d = computed(() => { call_count++; return b.value + ' ' + c.value; });
+
+	tests.assert_equal(d.value, 'a c');
+	call_count = 0;
+
+	a.value = 'aa';
+	tests.assert_equal(d.value, 'aa c');
+	tests.assert_equal(call_count, 1);
+});
+
+tests.run('computed: ensures sub updates even if two deps unmark it', () => {
+	const a = signal('a');
+	const b = computed(() => a.value);
+	const c = computed(() => { a.value; return 'c'; });
+	const d = computed(() => { a.value; return 'd'; });
+	let call_count = 0;
+	const e = computed(() => { call_count++; return b.value + ' ' + c.value + ' ' + d.value; });
+
+	tests.assert_equal(e.value, 'a c d');
+	call_count = 0;
+
+	a.value = 'aa';
+	tests.assert_equal(e.value, 'aa c d');
+	tests.assert_equal(call_count, 1);
+});
+
+tests.run('batch: runs pending effects even if callback throws', () => {
+	const a = signal(0);
+	const b = signal(1);
+	let count1 = 0;
+	let count2 = 0;
+
+	effect(() => { a.value; count1++; });
+	effect(() => { b.value; count2++; });
+	count1 = 0;
+	count2 = 0;
+
+	let threw = false;
+	try {
+		batch(() => {
+			a.value++;
+			b.value++;
+			throw new Error('hello');
+		});
+	} catch { threw = true; }
+
+	tests.assert(threw);
+	tests.assert_equal(count1, 1);
+	tests.assert_equal(count2, 1);
+});
+
+tests.run('batch: computed reads mid-batch return fresh value', () => {
+	const counter = signal(0);
+	const double = computed(() => counter.value * 2);
+	const triple = computed(() => counter.value * 3);
+	const results: number[][] = [];
+
+	effect(() => { results.push([double.value, triple.value]); });
+	tests.assert_equal(results[0][0], 0);
+	tests.assert_equal(results[0][1], 0);
+
+	batch(() => {
+		counter.value = 1;
+		tests.assert_equal(double.value, 2); // must be fresh inside batch
+	});
+
+	tests.assert_equal(results[1][0], 2);
+	tests.assert_equal(results[1][1], 3);
+});
+
+tests.run('effect: runs immediately on creation', () => {
+	let call_count = 0;
+	const dispose = effect(() => { call_count++; });
+
+	tests.assert_equal(call_count, 1);
+	dispose();
+});
+
+tests.run('effect: re-runs when dependency changes', () => {
+	const a = signal<number>(1);
+	let call_count = 0;
+	const dispose = effect(() => {
+		a.value;
+		call_count++;
+	});
+
+	tests.assert_equal(call_count, 1);
+	a.value = 2;
+	tests.assert_equal(call_count, 2);
+	dispose();
+});
+
+tests.run('effect: disposes and stops re-running', () => {
+	const a = signal<number>(1);
+	let call_count = 0;
+	const dispose = effect(() => {
+		a.value;
+		call_count++;
+	});
+
+	tests.assert_equal(call_count, 1);
+	dispose();
+	a.value = 2;
+	tests.assert_equal(call_count, 1);
+});
+
+tests.run('effect: conditional dependencies (dynamic tracking)', () => {
+	const flag = signal<boolean>(true);
+	const a = signal<number>(1);
+	const b = signal<number>(2);
+	let call_count = 0;
+	const dispose = effect(() => {
+		call_count++;
+		if (flag.value) { a.value; } else { b.value; }
+	});
+
+	tests.assert_equal(call_count, 1);
+	flag.value = false;
+	tests.assert_equal(call_count, 2);
+	// a is no longer tracked — should not trigger
+	a.value = 99;
+	tests.assert_equal(call_count, 2);
+	// b is now tracked
+	b.value = 10;
+	tests.assert_equal(call_count, 3);
+	dispose();
+});
+
+tests.run('effect: re-tracks dependencies on each run', () => {
+	const flag = signal<boolean>(true);
+	const a = signal<number>(1);
+	const b = signal<number>(2);
+	let call_count = 0;
+	const dispose = effect(() => {
+		call_count++;
+		if (flag.value) { a.value; } else { b.value; }
+	});
+
+	tests.assert_equal(call_count, 1);
+	flag.value = false;
+	tests.assert_equal(call_count, 2);
+	a.value = 5;
+	tests.assert_equal(call_count, 2);
+	b.value = 5;
+	tests.assert_equal(call_count, 3);
+	dispose();
+});
+
+tests.run('effect: nested effects do not share tracking context', () => {
+	const a = signal<number>(1);
+	const b = signal<number>(2);
+	let outer_count = 0;
+	let inner_count = 0;
+	const dispose = effect(() => {
+		outer_count++;
+		a.value;
+		const inner_dispose = effect(() => {
+			inner_count++;
+			b.value;
+		});
+		// inner_dispose intentionally not called to keep inner alive across b changes
+		void inner_dispose;
+	});
+
+	tests.assert_equal(outer_count, 1);
+	tests.assert_equal(inner_count, 1);
+	b.value = 99;
+	tests.assert_equal(outer_count, 1);
+	tests.assert_equal(inner_count, 2);
+	dispose();
+});
+
+tests.run('effect: does not re-run for same value', () => {
+	const a = signal<number>(1);
+	let call_count = 0;
+	const dispose = effect(() => {
+		a.value;
+		call_count++;
+	});
+
+	tests.assert_equal(call_count, 1);
+	a.value = 1;
+	tests.assert_equal(call_count, 1);
+	dispose();
+});
+
+tests.run('effect: batch deduplicates re-runs', () => {
+	const a = signal<number>(1);
+	const b = signal<number>(2);
+	let call_count = 0;
+	const dispose = effect(() => {
+		a.value;
+		b.value;
+		call_count++;
+	});
+
+	tests.assert_equal(call_count, 1);
+
+	batch(() => {
+		a.value = 10;
+		b.value = 20;
+	});
+
+	tests.assert_equal(call_count, 2);
+
+	dispose();
+});
+
+tests.run('effect: works with computed dependency', () => {
+	const a = signal<number>(1);
+	const c = computed<number>(() => a.value * 2);
+
+	let last_value = 0;
+
+	const dispose = effect(() => {
+		last_value = c.value;
+	});
+
+	tests.assert_equal(last_value, 2);
+	a.value = 5;
+	tests.assert_equal(last_value, 10);
+
+	dispose();
+});
+
+tests.run('effect: dispose is idempotent', () => {
+	const a = signal<number>(1);
+	const dispose = effect(() => { a.value; });
+
+	let threw = false;
+
+	try {
+		dispose();
+		dispose();
+	} catch (_) {
+		threw = true;
+	}
+
+	tests.assert(!threw, 'dispose() twice must not throw');
+});
+
 tests.print_results();
